@@ -1,0 +1,358 @@
+# -*- coding: utf-8 -*-
+# MultiPageTile.FCMacro  (v3)
+# Tiles a body view across multiple A4 pages, auto-adds a geometric hatch.
+# claude-opus-4-8-thinking
+# works 2026-06-20
+# Issues: - deletion of drawing pops Warning: Contains elements
+#		  - everything is hatched not only the largest area
+
+import os
+import math
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtGui, QtCore
+
+TEMPLATE_NAME = "Default_Template_A4_Landscape.svg"
+
+
+# ----------------------------------------------------------------------
+def find_template(name):
+    res = App.getResourceDir()
+    user = App.getUserAppDataDir()
+    for c in (os.path.join(res, "Mod", "TechDraw", "Templates", name),
+              os.path.join(user, "Templates", name),
+              os.path.join(user, "Mod", "TechDraw", "Templates", name)):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def find_pat_pattern():
+    """Return (file, name) for a geometric hatch pattern."""
+    p = App.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/PAT")
+    f = p.GetString("FilePattern", "")
+    n = p.GetString("NamePattern", "") or "Diamond"
+    if f and os.path.isfile(f):
+        return f, n
+    res = App.getResourceDir()
+    for sub in ("Patterns", "PAT"):
+        for fn in ("FCPAT.pat", "simple.pat", "hatch.pat"):
+            cand = os.path.join(res, "Mod", "TechDraw", sub, fn)
+            if os.path.isfile(cand):
+                return cand, n
+    return "", n
+
+
+# ----------------------------------------------------------------------
+class TileDialog(QtGui.QDialog):
+    def __init__(self):
+        super(TileDialog, self).__init__()
+        self.setWindowTitle("Multi-Page Tile Settings")
+        self.setMinimumWidth(360)
+        self.hatch_color = (0.5, 0.5, 0.5)   # grey default
+        layout = QtGui.QFormLayout(self)
+
+        self.rotation = QtGui.QDoubleSpinBox()
+        self.rotation.setRange(-360, 360); self.rotation.setSuffix(" °")
+        layout.addRow("View rotation:", self.rotation)
+
+        self.scale = QtGui.QDoubleSpinBox()
+        self.scale.setRange(0.001, 1000); self.scale.setDecimals(3)
+        self.scale.setValue(1.0)
+        layout.addRow("Scale:", self.scale)
+
+        self.margin = QtGui.QDoubleSpinBox()
+        self.margin.setRange(0, 50); self.margin.setValue(10.0)
+        self.margin.setSuffix(" mm")
+        layout.addRow("Non-printable margin:", self.margin)
+
+        self.overlap = QtGui.QDoubleSpinBox()
+        self.overlap.setRange(0, 100); self.overlap.setValue(10.0)
+        self.overlap.setSuffix(" mm")
+        layout.addRow("Overlap (glue tab):", self.overlap)
+
+        self.direction = QtGui.QComboBox()
+        self.direction.addItems(["Top (Z)", "Front (-Y)", "Right (X)",
+                                 "Bottom (-Z)", "Back (Y)", "Left (-X)"])
+        layout.addRow("View direction:", self.direction)
+
+        # ---- hatch options ----
+        self.hatch_enable = QtGui.QCheckBox(); self.hatch_enable.setChecked(True)
+        layout.addRow("Add hatch:", self.hatch_enable)
+
+        self.hatch_scale = QtGui.QDoubleSpinBox()
+        self.hatch_scale.setRange(0.01, 1000); self.hatch_scale.setValue(20.0)
+        layout.addRow("Hatch scale:", self.hatch_scale)
+
+        self.hatch_weight = QtGui.QDoubleSpinBox()
+        self.hatch_weight.setRange(0.0, 5.0); self.hatch_weight.setDecimals(2)
+        self.hatch_weight.setValue(0.30)
+        layout.addRow("Hatch line weight:", self.hatch_weight)
+
+        self.color_btn = QtGui.QPushButton("Pick colour")
+        self.color_btn.clicked.connect(self.pick_color)
+        self._update_btn()
+        layout.addRow("Hatch colour:", self.color_btn)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _qcolor(self):
+        r, g, b = self.hatch_color
+        return QtGui.QColor(int(r * 255), int(g * 255), int(b * 255))
+
+    def _update_btn(self):
+        r, g, b = [int(v * 255) for v in self.hatch_color]
+        self.color_btn.setStyleSheet(
+            "background-color: rgb(%d,%d,%d); color: white;" % (r, g, b))
+
+    def pick_color(self):
+        c = QtGui.QColorDialog.getColor(self._qcolor())
+        if c.isValid():
+            self.hatch_color = (c.redF(), c.greenF(), c.blueF())
+            self._update_btn()
+
+    def values(self):
+        dirs = {
+            "Top (Z)":     App.Vector(0, 0, 1),
+            "Front (-Y)":  App.Vector(0, -1, 0),
+            "Right (X)":   App.Vector(1, 0, 0),
+            "Bottom (-Z)": App.Vector(0, 0, -1),
+            "Back (Y)":    App.Vector(0, 1, 0),
+            "Left (-X)":   App.Vector(-1, 0, 0),
+        }
+        return {
+            "rotation":     self.rotation.value(),
+            "scale":        self.scale.value(),
+            "margin":       self.margin.value(),
+            "overlap":      self.overlap.value(),
+            "direction":    dirs[self.direction.currentText()],
+            "hatch":        self.hatch_enable.isChecked(),
+            "hatch_scale":  self.hatch_scale.value(),
+            "hatch_weight": self.hatch_weight.value(),
+            "hatch_color":  self.hatch_color,
+        }
+
+
+# ----------------------------------------------------------------------
+def get_source():
+    sel = Gui.Selection.getSelection()
+    if sel:
+        return sel[0]
+    for obj in App.ActiveDocument.Objects:
+        if obj.TypeId == "PartDesign::Body":
+            return obj
+    return None
+
+
+# ----------------------------------------------------------------------
+def measure_view(doc, source, cfg, template_path):
+    page = doc.addObject('TechDraw::DrawPage', 'TMP_MeasurePage')
+    tpl = doc.addObject('TechDraw::DrawSVGTemplate', 'TMP_Template')
+    tpl.Template = template_path
+    page.Template = tpl
+    view = doc.addObject('TechDraw::DrawViewPart', 'TMP_Measure')
+    page.addView(view)
+    view.Source = [source]
+    view.Direction = cfg["direction"]
+    view.Rotation = cfg["rotation"]
+    view.Scale = cfg["scale"]
+    view.recompute(); doc.recompute()
+    if App.GuiUp:
+        Gui.updateGui(); QtCore.QCoreApplication.processEvents()
+    doc.recompute()
+
+    w = h = 0.0
+    try:
+        w = float(view.getXSize()); h = float(view.getYSize())
+    except Exception:
+        pass
+    if w <= 0.0 or h <= 0.0:
+        try:
+            bb = source.Shape.BoundBox
+            d = cfg["direction"]
+            dims = {
+                (0, 0, 1): (bb.XLength, bb.YLength),
+                (0, 0, -1): (bb.XLength, bb.YLength),
+                (0, -1, 0): (bb.XLength, bb.ZLength),
+                (0, 1, 0): (bb.XLength, bb.ZLength),
+                (1, 0, 0): (bb.YLength, bb.ZLength),
+                (-1, 0, 0): (bb.YLength, bb.ZLength),
+            }
+            bw, bh = dims.get((int(d.x), int(d.y), int(d.z)),
+                              (bb.XLength, bb.YLength))
+            w = bw * cfg["scale"]; h = bh * cfg["scale"]
+        except Exception:
+            w = h = 0.0
+
+    doc.removeObject(view.Name)
+    doc.removeObject(tpl.Name)
+    doc.removeObject(page.Name)
+    doc.recompute()
+    return w, h
+
+
+# ----------------------------------------------------------------------
+def get_view_faces(doc, view, patfile, patname, max_faces=400):
+    """Probe Face0..FaceN to find existing projected faces."""
+    probe = doc.addObject('TechDraw::DrawGeomHatch', 'ProbeHatch')
+    if patfile:
+        probe.FilePattern = patfile
+        probe.NamePattern = patname
+    names = []
+    fails = 0
+    for i in range(max_faces):
+        sub = 'Face%d' % i
+        try:
+            probe.Source = (view, [sub])
+            doc.recompute()
+        except Exception:
+            break
+        st = list(probe.State)
+        if ('Invalid' in st) or ('Error' in st):
+            fails += 1
+            if fails >= 2:
+                break
+        else:
+            names.append(sub)
+            fails = 0
+    doc.removeObject(probe.Name)
+    doc.recompute()
+    return names
+
+
+def add_hatch(doc, page, view, faces, patfile, patname, scale, color, weight):
+    if not faces:
+        return None
+    hatch = doc.addObject('TechDraw::DrawGeomHatch', view.Name + '_Hatch')
+    if patfile:
+        hatch.FilePattern = patfile
+    if patname:
+        hatch.NamePattern = patname
+    hatch.ScalePattern = scale
+    hatch.Source = (view, faces)
+    try:
+        page.addView(hatch)          # owned by page -> clean delete
+    except Exception:
+        pass
+    doc.recompute()
+    vo = hatch.ViewObject
+    for prop in ('ColorPattern', 'PatternColor', 'LineColor'):
+        if hasattr(vo, prop):
+            try:
+                setattr(vo, prop, color); break
+            except Exception:
+                pass
+    if weight:
+        for prop in ('WeightPattern', 'LineWidth'):
+            if hasattr(vo, prop):
+                try:
+                    setattr(vo, prop, weight); break
+                except Exception:
+                    pass
+    return hatch
+
+
+# ----------------------------------------------------------------------
+def run():
+    doc = App.ActiveDocument
+    if doc is None:
+        QtGui.QMessageBox.critical(None, "Error", "No active document."); return
+
+    template_path = find_template(TEMPLATE_NAME)
+    if template_path is None:
+        fn, _ = QtGui.QFileDialog.getOpenFileName(
+            None, "Locate %s" % TEMPLATE_NAME, "", "SVG (*.svg)")
+        if not fn:
+            return
+        template_path = fn
+
+    source = get_source()
+    if source is None:
+        QtGui.QMessageBox.critical(None, "Error",
+                                   "Select a Body (or shape) first."); return
+
+    dlg = TileDialog()
+    if dlg.exec_() != QtGui.QDialog.Accepted:
+        return
+    cfg = dlg.values()
+
+    patfile, patname = find_pat_pattern()
+    if cfg["hatch"] and not patfile:
+        QtGui.QMessageBox.warning(None, "Hatch",
+            "No .pat pattern file found; hatches will be skipped.")
+        cfg["hatch"] = False
+
+    page_w, page_h = 297.0, 210.0
+    m = cfg["margin"]; ov = cfg["overlap"]
+    printable_w = page_w - 2 * m
+    printable_h = page_h - 2 * m
+    step_w = printable_w - ov
+    step_h = printable_h - ov
+    if step_w <= 0 or step_h <= 0:
+        QtGui.QMessageBox.critical(None, "Error",
+                                   "Margin + overlap too large for A4."); return
+
+    total_w, total_h = measure_view(doc, source, cfg, template_path)
+    if total_w <= 0 or total_h <= 0:
+        QtGui.QMessageBox.critical(None, "Error",
+            "Could not measure the view size."); return
+
+    cols = max(1, int(math.ceil((total_w - ov) / step_w + 1e-6)))
+    rows = max(1, int(math.ceil((total_h - ov) / step_h + 1e-6)))
+
+    msg = ("Projected size: %.1f x %.1f mm (scaled %.3f)\n"
+           "Step/page:      %.1f x %.1f mm  (overlap %.1f)\n\n"
+           "Will create %d cols x %d rows = %d pages.\n\nContinue?"
+           % (total_w, total_h, cfg["scale"], step_w, step_h, ov,
+              cols, rows, cols * rows))
+    if QtGui.QMessageBox.question(None, "Confirm", msg,
+            QtGui.QMessageBox.Yes | QtGui.QMessageBox.No) != QtGui.QMessageBox.Yes:
+        return
+
+    doc.openTransaction("MultiPageTile")
+    face_names = None
+    try:
+        for r in range(rows):
+            for c in range(cols):
+                page = doc.addObject('TechDraw::DrawPage',
+                                     'Page_r%d_c%d' % (r + 1, c + 1))
+                tpl = doc.addObject('TechDraw::DrawSVGTemplate',
+                                    'Tpl_r%d_c%d' % (r + 1, c + 1))
+                tpl.Template = template_path
+                page.Template = tpl
+                page.Label = "Tile r%d c%d" % (r + 1, c + 1)
+
+                view = doc.addObject('TechDraw::DrawViewPart',
+                                     'View_r%d_c%d' % (r + 1, c + 1))
+                page.addView(view)
+                view.Source = [source]
+                view.Direction = cfg["direction"]
+                view.Rotation = cfg["rotation"]
+                view.Scale = cfg["scale"]
+                view.X = m + total_w / 2.0 - c * step_w
+                view.Y = m + total_h / 2.0 - r * step_h
+                doc.recompute()
+
+                if cfg["hatch"]:
+                    if face_names is None:   # identical projection -> probe once
+                        face_names = get_view_faces(doc, view, patfile, patname)
+                    add_hatch(doc, page, view, face_names, patfile, patname,
+                              cfg["hatch_scale"], cfg["hatch_color"],
+                              cfg["hatch_weight"])
+        doc.commitTransaction()
+    except Exception as e:
+        doc.abortTransaction()
+        QtGui.QMessageBox.critical(None, "Error", str(e)); return
+
+    doc.recompute()
+    QtGui.QMessageBox.information(None, "Done",
+        "Created %d pages.\nTo remove them, delete the PAGE objects "
+        "(not the sub-views) to avoid reference warnings."
+        % (cols * rows))
+
+
+run()
